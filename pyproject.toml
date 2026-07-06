@@ -1,0 +1,18 @@
+[project]
+name = "sailing-simulator"
+version = "0.1.0"
+description = "A small PyGame sailing simulator with testable sailing physics."
+requires-python = ">=3.10"
+dependencies = [
+    "pygame>=2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
