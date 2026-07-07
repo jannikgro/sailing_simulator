@@ -1,13 +1,19 @@
-"""PyGame interface for the sailing simulator."""
+"""PyGame interface for the sailing simulator.
+
+The app is a small state machine: a level-select menu, the level itself, and a
+level-complete screen. Failing a level (capsize, rock, collision) shows a
+three-second countdown and respawns the boat at the last rounded buoy.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from math import atan2, cos, radians, sin
+from dataclasses import dataclass, field
+from math import atan2, ceil, cos, hypot, radians, sin
 from typing import Iterable
 
 import pygame
 
+from .levels import LEVELS, Level, Objective, build_simulation
 from .physics import (
     MAX_SHEET_ANGLE_DEG,
     CAPSIZE_HEEL_DEG,
@@ -16,10 +22,11 @@ from .physics import (
     SailingSimulation,
     TrafficVessel,
     WARNING_HEEL_DEG,
+    bearing_between,
     calculate_sail_forces,
     clamp,
-    default_traffic,
     nav_vector,
+    normalize_degrees,
     sailing_terms,
     signed_angle_diff,
     stability_state,
@@ -49,13 +56,16 @@ ROCK_LIGHT = (136, 127, 112)
 BUOY_RED = (220, 68, 58)
 BUOY_GREEN = (54, 172, 107)
 BUOY_YELLOW = (242, 205, 83)
+BUOY_DONE = (116, 132, 130)
 MOTORBOAT = (232, 128, 64)
 TRAFFIC_SAIL = (226, 232, 218)
+ACCENT = (120, 214, 196)
 BOOM_LENGTH = 68.0
 SAIL_HEAD_FORWARD = 58.0
 MIN_BOOM_ANGLE_DEG = 8.0
 GAME_SPEED = 0.72
-DEFAULT_COURSE_WIND_FROM_DEG = 55.0
+RESPAWN_SECONDS = 3.0
+BRIEFING_SECONDS = 10.0
 POINT_OF_SAIL_BANDS = [
     ("irons", 0.0, NO_GO_ZONE_DEG, DANGER),
     ("close", NO_GO_ZONE_DEG, 60.0, WARNING),
@@ -65,13 +75,141 @@ POINT_OF_SAIL_BANDS = [
 ]
 
 
+# --- level session -----------------------------------------------------------
+
+
+def sailable_heading(wind_from_deg: float, desired_heading_deg: float) -> float:
+    """Nudge a heading out of the no-go zone so a respawned boat can sail."""
+
+    relative = signed_angle_diff(wind_from_deg, desired_heading_deg)
+    if abs(relative) >= NO_GO_ZONE_DEG + 10.0:
+        return normalize_degrees(desired_heading_deg)
+    side = 1.0 if relative >= 0.0 else -1.0
+    return normalize_degrees(wind_from_deg - side * (NO_GO_ZONE_DEG + 15.0))
+
+
 @dataclass
-class CourseMarker:
-    kind: str
-    east: float
-    north: float
-    label: str = ""
-    color: tuple[int, int, int] = BUOY_YELLOW
+class LevelSession:
+    """Progress through one level: objectives, checkpoints, fail-and-respawn."""
+
+    level: Level
+    sim: SailingSimulation
+    target_index: int = 0
+    elapsed: float = 0.0
+    respawn_timer: float = 0.0
+    failure_reason: str = ""
+    completed: bool = False
+    checkpoint: tuple[float, float] = (0.0, 0.0)
+
+    @classmethod
+    def begin(cls, level: Level) -> "LevelSession":
+        return cls(level=level, sim=build_simulation(level))
+
+    @property
+    def failed(self) -> bool:
+        return self.respawn_timer > 0.0
+
+    def current_objective(self) -> Objective | None:
+        if self.target_index < len(self.level.objectives):
+            return self.level.objectives[self.target_index]
+        return None
+
+    def update(self, dt: float) -> None:
+        self.sim.step(dt)
+        if self.completed:
+            return
+        if self.failed:
+            self.respawn_timer -= dt
+            if self.respawn_timer <= 0.0:
+                self.respawn_timer = 0.0
+                self._respawn()
+            return
+
+        self.elapsed += dt
+        if self.sim.wrecked:
+            self.failure_reason = self._describe_failure()
+            self.respawn_timer = RESPAWN_SECONDS
+            return
+
+        objective = self.current_objective()
+        if objective is None:
+            return
+        boat = self.sim.boat
+        distance = hypot(
+            objective.east - boat.position_east, objective.north - boat.position_north
+        )
+        if distance < objective.radius:
+            self.checkpoint = (objective.east, objective.north)
+            self.sim.actions.push(f"rounded {objective.label}")
+            self.target_index += 1
+            if self.target_index >= len(self.level.objectives):
+                self.completed = True
+
+    def _describe_failure(self) -> str:
+        if self.sim.boat.capsized:
+            return "Capsized!"
+        if self.sim.grounded:
+            return "You hit a rock!"
+        if self.sim.collided_vessel_id is not None:
+            return f"Collision with {self.sim.collided_vessel_id}!"
+        return "Wrecked!"
+
+    def _respawn(self) -> None:
+        objective = self.current_objective()
+        if objective is not None:
+            desired = bearing_between(
+                self.checkpoint[0], self.checkpoint[1], objective.east, objective.north
+            )
+        else:
+            desired = self.level.start_heading_deg
+        heading = sailable_heading(self.sim.wind.from_deg, desired)
+        self.failure_reason = ""
+        self.sim.respawn_at(self.checkpoint[0], self.checkpoint[1], heading)
+
+
+# --- menu --------------------------------------------------------------------
+
+
+def menu_row_rect(index: int) -> pygame.Rect:
+    return pygame.Rect(64, 148 + index * 64, 440, 56)
+
+
+@dataclass
+class MenuState:
+    selected: int = 0
+    completed: set[int] = field(default_factory=set)
+
+    def move(self, delta: int) -> None:
+        self.selected = (self.selected + delta) % len(LEVELS)
+
+    def handle_event(self, event: pygame.event.Event) -> str | None:
+        if event.type == pygame.KEYDOWN:
+            if event.key in (pygame.K_UP, pygame.K_w):
+                self.move(-1)
+            elif event.key in (pygame.K_DOWN, pygame.K_s):
+                self.move(1)
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                return "start"
+            elif event.key == pygame.K_ESCAPE:
+                return "quit"
+            elif pygame.K_1 <= event.key <= pygame.K_9:
+                index = event.key - pygame.K_1
+                if index < len(LEVELS):
+                    self.selected = index
+                    return "start"
+        elif event.type == pygame.MOUSEMOTION:
+            for index in range(len(LEVELS)):
+                if menu_row_rect(index).collidepoint(event.pos):
+                    self.selected = index
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for index in range(len(LEVELS)):
+                if menu_row_rect(index).collidepoint(event.pos):
+                    self.selected = index
+                    return "start"
+        return None
+
+
+# --- widgets -----------------------------------------------------------------
 
 
 @dataclass
@@ -218,44 +356,6 @@ def point_of_sail_marker_x(relative_wind_deg: float, track: pygame.Rect) -> int:
     return track.x + int(round(track.width * fraction))
 
 
-def course_point(
-    start: tuple[float, float], heading_deg: float, distance: float
-) -> tuple[float, float]:
-    east, north = nav_vector(heading_deg)
-    return start[0] + east * distance, start[1] + north * distance
-
-
-def default_course_markers() -> list[CourseMarker]:
-    start = (0.0, 260.0)
-    windward_starboard = DEFAULT_COURSE_WIND_FROM_DEG - 40.0
-    windward_port = DEFAULT_COURSE_WIND_FROM_DEG + 40.0
-    downwind = (DEFAULT_COURSE_WIND_FROM_DEG + 180.0) % 360.0
-
-    tack_1 = course_point(start, windward_starboard, 520.0)
-    tack_2 = course_point(tack_1, windward_port, 520.0)
-    tack_3 = course_point(tack_2, windward_starboard, 520.0)
-    windward = course_point(tack_3, windward_port, 470.0)
-    run_1 = course_point(windward, downwind, 660.0)
-    run_2 = course_point(run_1, downwind, 660.0)
-    finish = course_point(run_2, downwind, 520.0)
-
-    return [
-        CourseMarker("buoy", start[0], start[1], "Start", BUOY_YELLOW),
-        CourseMarker("buoy", tack_1[0], tack_1[1], "Tack 1", BUOY_RED),
-        CourseMarker("buoy", tack_2[0], tack_2[1], "Tack 2", BUOY_GREEN),
-        CourseMarker("buoy", tack_3[0], tack_3[1], "Tack 3", BUOY_RED),
-        CourseMarker("buoy", windward[0], windward[1], "Windward", BUOY_YELLOW),
-        CourseMarker("buoy", run_1[0], run_1[1], "Run 1", BUOY_GREEN),
-        CourseMarker("buoy", run_2[0], run_2[1], "Run 2", BUOY_RED),
-        CourseMarker("buoy", finish[0], finish[1], "Finish", BUOY_YELLOW),
-        CourseMarker("rock", -260.0, 455.0),
-        CourseMarker("rock", 470.0, 610.0),
-        CourseMarker("rock", 700.0, 1035.0),
-        CourseMarker("rock", 1120.0, 930.0),
-        CourseMarker("rock", 365.0, 625.0),
-    ]
-
-
 def world_to_screen(
     sim: SailingSimulation,
     east: float,
@@ -268,17 +368,8 @@ def world_to_screen(
     )
 
 
-def visible_course_markers(
-    sim: SailingSimulation,
-    markers: Iterable[CourseMarker],
-    margin: float = 80.0,
-) -> list[tuple[CourseMarker, tuple[float, float]]]:
-    visible = []
-    for marker in markers:
-        pos = world_to_screen(sim, marker.east, marker.north)
-        if -margin <= pos[0] <= WIDTH + margin and -margin <= pos[1] <= HEIGHT + margin:
-            visible.append((marker, pos))
-    return visible
+def on_screen(pos: tuple[float, float], margin: float = 80.0) -> bool:
+    return -margin <= pos[0] <= WIDTH + margin and -margin <= pos[1] <= HEIGHT + margin
 
 
 def visible_traffic(
@@ -288,7 +379,7 @@ def visible_traffic(
     visible = []
     for vessel in sim.traffic:
         pos = world_to_screen(sim, vessel.position_east, vessel.position_north)
-        if -margin <= pos[0] <= WIDTH + margin and -margin <= pos[1] <= HEIGHT + margin:
+        if on_screen(pos, margin):
             visible.append((vessel, pos))
     return visible
 
@@ -456,44 +547,118 @@ def draw_water(surface: pygame.Surface, wind_from_deg: float, time_s: float) -> 
             pygame.draw.line(surface, WATER_DARK, start, end, 2)
 
 
-def draw_course_markers(
+def rock_polygon(x: float, y: float, radius: float) -> list[tuple[float, float]]:
+    scale = radius / 24.0
+    points = [(-24, 10), (-12, -12), (9, -18), (25, 5), (12, 18), (-17, 17)]
+    return [(x + px * scale, y + py * scale) for px, py in points]
+
+
+def draw_rocks(surface: pygame.Surface, sim: SailingSimulation) -> None:
+    for rock in sim.rocks:
+        pos = world_to_screen(sim, rock.east, rock.north)
+        if not on_screen(pos):
+            continue
+        x, y = pos
+        scale = rock.radius / 24.0
+        shadow = [
+            (x - 22 * scale, y + 14 * scale),
+            (x + 24 * scale, y + 15 * scale),
+            (x + 12 * scale, y + 23 * scale),
+            (x - 18 * scale, y + 21 * scale),
+        ]
+        pygame.draw.polygon(surface, (13, 48, 63), shadow)
+        pygame.draw.polygon(surface, ROCK, rock_polygon(x, y, rock.radius))
+        pygame.draw.line(
+            surface,
+            ROCK_LIGHT,
+            (x - 11 * scale, y - 8 * scale),
+            (x + 8 * scale, y - 13 * scale),
+            2,
+        )
+        pygame.draw.line(
+            surface,
+            (65, 59, 54),
+            (x - 15 * scale, y + 12 * scale),
+            (x + 15 * scale, y + 10 * scale),
+            2,
+        )
+
+
+def objective_color(index: int, total: int) -> tuple[int, int, int]:
+    if index == total - 1:
+        return BUOY_YELLOW
+    return BUOY_RED if index % 2 == 0 else BUOY_GREEN
+
+
+def draw_objectives(
     surface: pygame.Surface,
     font: pygame.font.Font,
-    sim: SailingSimulation,
-    markers: Iterable[CourseMarker],
+    session: LevelSession,
     time_s: float,
 ) -> None:
-    marker_list = list(markers)
-    buoy_points = [
-        world_to_screen(sim, marker.east, marker.north)
-        for marker in marker_list
-        if marker.kind == "buoy"
+    sim = session.sim
+    objectives = session.level.objectives
+    remaining = [
+        world_to_screen(sim, objective.east, objective.north)
+        for objective in objectives[session.target_index :]
     ]
-    if len(buoy_points) > 1:
-        pygame.draw.lines(surface, (117, 180, 175), False, buoy_points, 2)
+    if remaining and not session.completed:
+        pygame.draw.lines(
+            surface, (117, 180, 175), False, [BOAT_CENTER] + remaining, 2
+        )
 
-    for marker, pos in visible_course_markers(sim, marker_list):
-        bob = sin(time_s * 2.0 + marker.east * 0.017 + marker.north * 0.006) * 3.0
+    for index, objective in enumerate(objectives):
+        pos = world_to_screen(sim, objective.east, objective.north)
+        if not on_screen(pos):
+            continue
+        bob = sin(time_s * 2.0 + objective.east * 0.017 + objective.north * 0.006) * 3.0
         x, y = pos[0], pos[1] + bob
-        if marker.kind == "rock":
-            shadow = [(x - 22, y + 14), (x + 24, y + 15), (x + 12, y + 23), (x - 18, y + 21)]
-            rock = [(x - 24, y + 10), (x - 12, y - 12), (x + 9, y - 18), (x + 25, y + 5), (x + 12, y + 18), (x - 17, y + 17)]
-            pygame.draw.polygon(surface, (13, 48, 63), shadow)
-            pygame.draw.polygon(surface, ROCK, rock)
-            pygame.draw.line(surface, ROCK_LIGHT, (x - 11, y - 8), (x + 8, y - 13), 2)
-            pygame.draw.line(surface, (65, 59, 54), (x - 15, y + 12), (x + 15, y + 10), 2)
-        else:
-            pygame.draw.line(surface, BLACK, (x, y + 22), (x, y - 18), 3)
-            pygame.draw.circle(surface, marker.color, (round(x), round(y)), 13)
-            pygame.draw.circle(surface, (246, 246, 230), (round(x), round(y - 3)), 5)
-            pygame.draw.polygon(
+        rounded = index < session.target_index
+        color = BUOY_DONE if rounded else objective_color(index, len(objectives))
+
+        if index == session.target_index and not session.completed:
+            pulse = 26 + sin(time_s * 4.0) * 4.0
+            pygame.draw.circle(surface, WARNING, (round(x), round(y)), int(pulse), 2)
+            pygame.draw.circle(
                 surface,
-                marker.color,
-                [(x, y - 24), (x + 9, y - 10), (x - 9, y - 10)],
+                (255, 255, 255),
+                (round(x), round(y)),
+                int(objective.radius),
+                1,
             )
-            if marker.label:
-                label = font.render(marker.label, True, TEXT)
-                surface.blit(label, (x - label.get_width() / 2, y + 18))
+
+        pygame.draw.line(surface, BLACK, (x, y + 22), (x, y - 18), 3)
+        pygame.draw.circle(surface, color, (round(x), round(y)), 13)
+        pygame.draw.circle(surface, (246, 246, 230), (round(x), round(y - 3)), 5)
+        pygame.draw.polygon(
+            surface,
+            color,
+            [(x, y - 24), (x + 9, y - 10), (x - 9, y - 10)],
+        )
+        label = font.render(objective.label, True, TEXT if not rounded else MUTED)
+        surface.blit(label, (x - label.get_width() / 2, y + 18))
+
+
+def draw_target_arrow(
+    surface: pygame.Surface, font: pygame.font.Font, session: LevelSession
+) -> None:
+    objective = session.current_objective()
+    if objective is None:
+        return
+    boat = session.sim.boat
+    distance = hypot(
+        objective.east - boat.position_east, objective.north - boat.position_north
+    )
+    if distance < 150.0:
+        return
+    bearing = bearing_between(
+        boat.position_east, boat.position_north, objective.east, objective.north
+    )
+    dx, dy = screen_vector(bearing, 96.0)
+    start = (BOAT_CENTER[0] + dx, BOAT_CENTER[1] + dy)
+    draw_arrow(surface, start, bearing, 30.0, ACCENT, 3)
+    label = font.render(f"{objective.label}  {distance:0.0f}", True, ACCENT)
+    surface.blit(label, (start[0] - label.get_width() / 2, start[1] + 14))
 
 
 def draw_traffic_vessels(
@@ -647,7 +812,6 @@ def info_lines(sim: SailingSimulation) -> list[tuple[str, tuple[int, int, int]]]
     boat = sim.boat
     wind = sim.wind
     terms = sailing_terms(boat, wind)
-    forces = calculate_sail_forces(boat, wind)
     stability = stability_state(boat)
     wind_to = (wind.from_deg + 180.0) % 360.0
 
@@ -880,6 +1044,209 @@ def draw_main_sheet_lever(
     pygame.draw.rect(surface, (255, 238, 170), knob.inflate(-10, -12), border_radius=3)
 
 
+# --- level overlays ----------------------------------------------------------
+
+
+def format_time(seconds: float) -> str:
+    minutes = int(seconds) // 60
+    return f"{minutes:02d}:{int(seconds) % 60:02d}"
+
+
+def draw_hud_banner(
+    surface: pygame.Surface,
+    font: pygame.font.Font,
+    small: pygame.font.Font,
+    session: LevelSession,
+) -> None:
+    rect = pygame.Rect(WIDTH // 2 - 230, 14, 460, 58)
+    panel = pygame.Surface(rect.size, pygame.SRCALPHA)
+    panel.fill((6, 19, 27, 205))
+    surface.blit(panel, rect)
+    pygame.draw.rect(surface, PANEL_BORDER, rect, 2, border_radius=6)
+
+    level = session.level
+    title = font.render(f"Level {level.number} - {level.title}", True, TEXT)
+    surface.blit(title, (rect.centerx - title.get_width() / 2, rect.y + 8))
+
+    objective = session.current_objective()
+    if session.completed:
+        progress = "course complete"
+    elif objective is not None:
+        progress = (
+            f"next: {objective.label}"
+            f"  ({session.target_index + 1}/{len(level.objectives)})"
+        )
+    else:
+        progress = ""
+    detail = small.render(
+        f"{progress}   time {format_time(session.elapsed)}"
+        f"   penalties {session.sim.penalty_count}",
+        True,
+        MUTED,
+    )
+    surface.blit(detail, (rect.centerx - detail.get_width() / 2, rect.y + 34))
+
+
+def draw_briefing(
+    surface: pygame.Surface,
+    font: pygame.font.Font,
+    small: pygame.font.Font,
+    session: LevelSession,
+) -> None:
+    if session.elapsed > BRIEFING_SECONDS or session.failed or session.completed:
+        return
+    lines = session.level.briefing
+    rect = pygame.Rect(24, HEIGHT - 60 - len(lines) * 20 - 44, 560, len(lines) * 20 + 44)
+    panel = pygame.Surface(rect.size, pygame.SRCALPHA)
+    panel.fill((6, 19, 27, 215))
+    surface.blit(panel, rect)
+    pygame.draw.rect(surface, PANEL_BORDER, rect, 2, border_radius=6)
+
+    header = font.render(session.level.skills.capitalize(), True, ACCENT)
+    surface.blit(header, (rect.x + 16, rect.y + 10))
+    y = rect.y + 38
+    for line in lines:
+        rendered = small.render(line, True, TEXT)
+        surface.blit(rendered, (rect.x + 16, y))
+        y += 20
+
+
+def draw_respawn_countdown(
+    surface: pygame.Surface,
+    big: pygame.font.Font,
+    font: pygame.font.Font,
+    session: LevelSession,
+) -> None:
+    if not session.failed:
+        return
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay.fill((8, 14, 20, 130))
+    surface.blit(overlay, (0, 0))
+
+    reason = font.render(session.failure_reason, True, DANGER)
+    surface.blit(reason, (WIDTH / 2 - reason.get_width() / 2, HEIGHT / 2 - 130))
+
+    count = big.render(str(max(1, ceil(session.respawn_timer))), True, TEXT)
+    surface.blit(count, (WIDTH / 2 - count.get_width() / 2, HEIGHT / 2 - 70))
+
+    hint = font.render("respawning at the last buoy...", True, MUTED)
+    surface.blit(hint, (WIDTH / 2 - hint.get_width() / 2, HEIGHT / 2 + 40))
+
+
+def draw_level_complete(
+    surface: pygame.Surface,
+    big: pygame.font.Font,
+    font: pygame.font.Font,
+    session: LevelSession,
+) -> None:
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay.fill((8, 14, 20, 130))
+    surface.blit(overlay, (0, 0))
+
+    rect = pygame.Rect(WIDTH // 2 - 260, HEIGHT // 2 - 130, 520, 260)
+    panel = pygame.Surface(rect.size, pygame.SRCALPHA)
+    panel.fill((6, 19, 27, 235))
+    surface.blit(panel, rect)
+    pygame.draw.rect(surface, ACCENT, rect, 2, border_radius=8)
+
+    title = big.render("Level Complete!", True, ACCENT)
+    surface.blit(title, (rect.centerx - title.get_width() / 2, rect.y + 26))
+
+    stats = font.render(
+        f"time {format_time(session.elapsed)}   penalties {session.sim.penalty_count}",
+        True,
+        TEXT,
+    )
+    surface.blit(stats, (rect.centerx - stats.get_width() / 2, rect.y + 110))
+
+    last_level = session.level.number >= len(LEVELS)
+    next_hint = (
+        "You finished the sailing school!"
+        if last_level
+        else "ENTER: next level"
+    )
+    hint_1 = font.render(next_hint, True, TEXT if last_level else MUTED)
+    hint_2 = font.render("ESC: back to menu", True, MUTED)
+    surface.blit(hint_1, (rect.centerx - hint_1.get_width() / 2, rect.y + 160))
+    surface.blit(hint_2, (rect.centerx - hint_2.get_width() / 2, rect.y + 192))
+
+
+# --- menu drawing -------------------------------------------------------------
+
+
+def draw_menu(
+    surface: pygame.Surface,
+    big: pygame.font.Font,
+    font: pygame.font.Font,
+    small: pygame.font.Font,
+    menu: MenuState,
+    time_s: float,
+) -> None:
+    draw_water(surface, 90.0, time_s)
+
+    title = big.render("SAILING SCHOOL", True, TEXT)
+    surface.blit(title, (64, 48))
+    subtitle = font.render(
+        "learn to sail, from the first reach to regatta day", True, MUTED
+    )
+    surface.blit(subtitle, (66, 100))
+
+    for index, level in enumerate(LEVELS):
+        rect = menu_row_rect(index)
+        selected = index == menu.selected
+        panel = pygame.Surface(rect.size, pygame.SRCALPHA)
+        panel.fill((10, 32, 44, 235) if selected else (6, 19, 27, 195))
+        surface.blit(panel, rect)
+        pygame.draw.rect(
+            surface, ACCENT if selected else PANEL_BORDER, rect, 2, border_radius=6
+        )
+
+        name = font.render(f"{level.number}. {level.title}", True, TEXT)
+        skills = small.render(level.skills, True, ACCENT if selected else MUTED)
+        surface.blit(name, (rect.x + 16, rect.y + 8))
+        surface.blit(skills, (rect.x + 16, rect.y + 32))
+
+        if level.number in menu.completed:
+            check = font.render("done", True, BUOY_GREEN)
+            surface.blit(check, (rect.right - check.get_width() - 16, rect.y + 16))
+
+    level = LEVELS[menu.selected]
+    info = pygame.Rect(540, 148, 420, 64 * len(LEVELS) - 8)
+    panel = pygame.Surface(info.size, pygame.SRCALPHA)
+    panel.fill((6, 19, 27, 215))
+    surface.blit(panel, info)
+    pygame.draw.rect(surface, PANEL_BORDER, info, 2, border_radius=6)
+
+    header = font.render(level.title, True, ACCENT)
+    surface.blit(header, (info.x + 18, info.y + 14))
+    y = info.y + 48
+    for line in level.briefing:
+        rendered = small.render(line, True, TEXT)
+        surface.blit(rendered, (info.x + 18, y))
+        y += 21
+
+    y += 14
+    wind = level.wind
+    facts = [
+        f"wind: {wind.speed:0.0f} kt from {wind.from_deg:03.0f}",
+        f"buoys: {len(level.objectives)}",
+        f"rocks: {'yes' if level.rocks else 'no'}",
+        f"traffic: {len(level.traffic) or 'no'}",
+    ]
+    for fact in facts:
+        rendered = small.render(fact, True, MUTED)
+        surface.blit(rendered, (info.x + 18, y))
+        y += 21
+
+    footer = small.render(
+        "UP/DOWN select   ENTER sail   ESC quit", True, MUTED
+    )
+    surface.blit(footer, (64, HEIGHT - 40))
+
+
+# --- input and main loop ------------------------------------------------------
+
+
 def key_is_down(keys: Iterable[bool], key: int) -> bool:
     try:
         return bool(keys[key])  # type: ignore[index]
@@ -887,11 +1254,7 @@ def key_is_down(keys: Iterable[bool], key: int) -> bool:
         return False
 
 
-def handle_keys(sim: SailingSimulation, keys: Iterable[bool], dt: float) -> bool:
-    quit_requested = False
-    if key_is_down(keys, pygame.K_ESCAPE):
-        quit_requested = True
-
+def handle_keys(sim: SailingSimulation, keys: Iterable[bool], dt: float) -> None:
     left = key_is_down(keys, pygame.K_LEFT) or key_is_down(keys, pygame.K_a)
     right = key_is_down(keys, pygame.K_RIGHT) or key_is_down(keys, pygame.K_d)
     if left and not right:
@@ -911,58 +1274,135 @@ def handle_keys(sim: SailingSimulation, keys: Iterable[bool], dt: float) -> bool
     elif ease and not trim_in:
         sim.adjust_sheet(1.0, dt)
 
-    if key_is_down(keys, pygame.K_r):
-        sim.right_boat()
 
-    return quit_requested
+def draw_scene(
+    screen: pygame.Surface,
+    fonts: dict[str, pygame.font.Font],
+    session: LevelSession,
+    sail_visual: SailVisualState,
+    sheet_lever: MainSheetLever,
+    no_sail_toggle: NoSailZoneToggle,
+    time_s: float,
+) -> None:
+    sim = session.sim
+    draw_water(screen, sim.wind.from_deg, time_s)
+    draw_rocks(screen, sim)
+    draw_objectives(screen, fonts["small"], session, time_s)
+    draw_traffic_vessels(screen, fonts["small"], sim, time_s)
+    draw_no_sail_zone(screen, sim, no_sail_toggle.enabled)
+    draw_boat(screen, sim, sail_visual)
+    draw_target_arrow(screen, fonts["small"], session)
+    draw_info_box(screen, fonts["font"], fonts["small"], sim)
+    draw_wind_indicator(screen, fonts["font"], sim)
+    draw_no_sail_toggle(screen, fonts["font"], fonts["small"], no_sail_toggle)
+    draw_sail_efficiency_panel(screen, fonts["font"], fonts["small"], sim)
+    draw_main_sheet_lever(screen, fonts["font"], fonts["small"], sim, sheet_lever)
+    draw_hud_banner(screen, fonts["font"], fonts["small"], session)
+    draw_briefing(screen, fonts["font"], fonts["small"], session)
+    draw_rule_penalty(screen, fonts["font"], sim)
+    draw_respawn_countdown(screen, fonts["big"], fonts["font"], session)
 
 
-def main() -> None:
+def main(max_frames: int | None = None) -> None:
     pygame.init()
     pygame.display.set_caption("Sailing Simulator")
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     clock = pygame.time.Clock()
-    font = pygame.font.SysFont("arial", 18)
-    small = pygame.font.SysFont("arial", 15)
-    sim = SailingSimulation(traffic=default_traffic())
-    sail_visual = SailVisualState.from_sim(sim)
+    fonts = {
+        "font": pygame.font.SysFont("arial", 18),
+        "small": pygame.font.SysFont("arial", 15),
+        "big": pygame.font.SysFont("arial", 56, bold=True),
+    }
+    menu = MenuState()
+    session: LevelSession | None = None
+    sail_visual = SailVisualState()
     sheet_lever = MainSheetLever.default()
     no_sail_toggle = NoSailZoneToggle.default()
-    course_markers = default_course_markers()
+    state = "menu"
     animation_time_s = 0.0
+    frames = 0
 
     running = True
     while running:
         dt = clock.tick(60) / 1000.0
-        for event in pygame.event.get():
+        events = pygame.event.get()
+        for event in events:
             if event.type == pygame.QUIT:
                 running = False
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_n:
-                no_sail_toggle.enabled = not no_sail_toggle.enabled
-            else:
-                if not no_sail_toggle.handle_event(event):
-                    sheet_lever.handle_event(sim, event)
 
-        keys = pygame.key.get_pressed()
-        if handle_keys(sim, keys, dt):
-            running = False
+        if state == "menu":
+            for event in events:
+                action = menu.handle_event(event)
+                if action == "quit":
+                    running = False
+                elif action == "start":
+                    session = LevelSession.begin(LEVELS[menu.selected])
+                    sail_visual = SailVisualState.from_sim(session.sim)
+                    sheet_lever = MainSheetLever.default()
+                    state = "playing"
+            animation_time_s += dt
 
-        sim_dt = scaled_game_dt(dt)
-        animation_time_s += sim_dt
-        sim.step(sim_dt)
-        sail_visual.update(sim, sim_dt)
-        draw_water(screen, sim.wind.from_deg, animation_time_s)
-        draw_course_markers(screen, small, sim, course_markers, animation_time_s)
-        draw_traffic_vessels(screen, small, sim, animation_time_s)
-        draw_no_sail_zone(screen, sim, no_sail_toggle.enabled)
-        draw_boat(screen, sim, sail_visual)
-        draw_info_box(screen, font, small, sim)
-        draw_wind_indicator(screen, font, sim)
-        draw_no_sail_toggle(screen, font, small, no_sail_toggle)
-        draw_sail_efficiency_panel(screen, font, small, sim)
-        draw_main_sheet_lever(screen, font, small, sim, sheet_lever)
-        draw_rule_penalty(screen, font, sim)
+        elif state == "playing" and session is not None:
+            for event in events:
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    state = "menu"
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_n:
+                    no_sail_toggle.enabled = not no_sail_toggle.enabled
+                elif not no_sail_toggle.handle_event(event):
+                    if not session.failed and not session.completed:
+                        sheet_lever.handle_event(session.sim, event)
+
+            if state == "playing":
+                keys = pygame.key.get_pressed()
+                if not session.failed and not session.completed:
+                    handle_keys(session.sim, keys, dt)
+
+                sim_dt = scaled_game_dt(dt)
+                animation_time_s += sim_dt
+                session.update(sim_dt)
+                sail_visual.update(session.sim, sim_dt)
+                if session.completed:
+                    menu.completed.add(session.level.number)
+                    state = "complete"
+
+        elif state == "complete" and session is not None:
+            for event in events:
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        state = "menu"
+                    elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        next_index = session.level.number  # numbers are 1-based
+                        if next_index < len(LEVELS):
+                            menu.selected = next_index
+                            session = LevelSession.begin(LEVELS[next_index])
+                            sail_visual = SailVisualState.from_sim(session.sim)
+                            sheet_lever = MainSheetLever.default()
+                            state = "playing"
+                        else:
+                            state = "menu"
+            animation_time_s += dt
+
+        if state == "menu" or session is None:
+            draw_menu(
+                screen, fonts["big"], fonts["font"], fonts["small"], menu, animation_time_s
+            )
+        else:
+            draw_scene(
+                screen,
+                fonts,
+                session,
+                sail_visual,
+                sheet_lever,
+                no_sail_toggle,
+                animation_time_s,
+            )
+            if state == "complete":
+                draw_level_complete(screen, fonts["big"], fonts["font"], session)
+
         pygame.display.flip()
+        frames += 1
+        if max_frames is not None and frames >= max_frames:
+            running = False
 
     pygame.quit()
 

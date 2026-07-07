@@ -1,4 +1,5 @@
 import os
+from collections import defaultdict
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
@@ -6,37 +7,51 @@ import pygame
 
 from sailing_simulator.game import (
     BOAT_CENTER,
+    BRIEFING_SECONDS,
     HEIGHT,
     WIDTH,
-    DEFAULT_COURSE_WIND_FROM_DEG,
     GAME_SPEED,
+    RESPAWN_SECONDS,
+    LevelSession,
     MainSheetLever,
+    MenuState,
     NoSailZoneToggle,
     POINT_OF_SAIL_BANDS,
     SailVisualState,
     boat_polygon,
-    course_point,
-    default_course_markers,
     desired_boom_angle,
     draw_boat,
-    draw_course_markers,
+    draw_briefing,
+    draw_hud_banner,
     draw_info_box,
+    draw_level_complete,
     draw_main_sheet_lever,
+    draw_menu,
     draw_no_sail_toggle,
     draw_no_sail_zone,
+    draw_objectives,
+    draw_respawn_countdown,
+    draw_rocks,
     draw_rule_penalty,
     draw_sail_efficiency_panel,
+    draw_scene,
+    draw_target_arrow,
     draw_tilt_meter,
     draw_traffic_vessels,
     draw_water,
     draw_wind_indicator,
     efficiency_color,
+    format_time,
     handle_keys,
     info_lines,
+    main,
+    menu_row_rect,
     no_sail_zone_points,
+    on_screen,
     point_of_sail_marker_x,
     sail_geometry,
     sail_efficiency,
+    sailable_heading,
     scaled_game_dt,
     sheet_from_lever_y,
     sheet_percent_in,
@@ -45,17 +60,192 @@ from sailing_simulator.game import (
     traffic_hull_polygon,
     tiller_rudder_geometry,
     visible_traffic,
-    visible_course_markers,
     world_to_screen,
 )
+from sailing_simulator.levels import LEVELS
 from sailing_simulator.physics import (
+    NO_GO_ZONE_DEG,
     BoatState,
     SailingSimulation,
     TrafficVessel,
     WindState,
-    bearing_between,
     signed_angle_diff,
 )
+
+
+def make_fonts() -> dict[str, pygame.font.Font]:
+    return {
+        "font": pygame.font.SysFont("arial", 18),
+        "small": pygame.font.SysFont("arial", 15),
+        "big": pygame.font.SysFont("arial", 56, bold=True),
+    }
+
+
+# --- level session -----------------------------------------------------------
+
+
+def test_session_begins_at_level_start_with_level_wind() -> None:
+    level = LEVELS[2]
+    session = LevelSession.begin(level)
+
+    assert session.sim.boat.position_east == 0.0
+    assert session.sim.boat.position_north == 0.0
+    assert session.sim.boat.heading_deg == level.start_heading_deg % 360.0
+    assert session.sim.wind.from_deg == level.wind.from_deg
+    assert session.target_index == 0
+    assert not session.completed
+    assert not session.failed
+
+
+def test_session_rounds_objectives_and_moves_checkpoint() -> None:
+    session = LevelSession.begin(LEVELS[0])
+    first = session.level.objectives[0]
+    session.sim.boat.position_east = first.east
+    session.sim.boat.position_north = first.north
+
+    session.update(0.02)
+
+    assert session.target_index == 1
+    assert session.checkpoint == (first.east, first.north)
+    assert f"rounded {first.label}" in session.sim.actions.messages
+
+
+def test_session_completes_after_last_objective() -> None:
+    session = LevelSession.begin(LEVELS[0])
+    for objective in session.level.objectives:
+        session.sim.boat.position_east = objective.east
+        session.sim.boat.position_north = objective.north
+        session.update(0.02)
+
+    assert session.completed
+    assert session.current_objective() is None
+
+
+def test_capsize_fails_the_session_and_starts_the_countdown() -> None:
+    session = LevelSession.begin(LEVELS[0])
+    session.sim.boat.capsized = True
+
+    session.update(0.02)
+
+    assert session.failed
+    assert session.respawn_timer > RESPAWN_SECONDS - 0.1
+    assert session.failure_reason == "Capsized!"
+
+
+def test_hitting_a_rock_reports_the_rock_failure() -> None:
+    session = LevelSession.begin(LEVELS[3])
+    session.sim.grounded = True
+
+    session.update(0.02)
+
+    assert session.failed
+    assert session.failure_reason == "You hit a rock!"
+
+
+def test_respawn_happens_after_the_three_second_countdown() -> None:
+    session = LevelSession.begin(LEVELS[0])
+    first = session.level.objectives[0]
+    session.sim.boat.position_east = first.east
+    session.sim.boat.position_north = first.north
+    session.update(0.02)
+    assert session.target_index == 1
+
+    session.sim.boat.position_east += 200.0
+    session.sim.boat.capsized = True
+    session.update(0.02)
+    assert session.failed
+
+    total = 0.0
+    while session.failed and total < RESPAWN_SECONDS + 0.5:
+        session.update(0.1)
+        total += 0.1
+
+    assert total >= RESPAWN_SECONDS - 0.2
+    assert not session.failed
+    assert not session.sim.boat.capsized
+    # The boat respawns exactly at the checkpoint buoy and sails on from there.
+    assert abs(session.sim.boat.position_east - first.east) < 20.0
+    assert abs(session.sim.boat.position_north - first.north) < 20.0
+    assert session.target_index == 1
+
+
+def test_elapsed_time_freezes_while_failed() -> None:
+    session = LevelSession.begin(LEVELS[0])
+    session.update(0.5)
+    assert session.elapsed > 0.0
+
+    session.sim.boat.capsized = True
+    session.update(0.02)
+    frozen = session.elapsed
+    session.update(0.5)
+
+    assert session.elapsed == frozen
+
+
+def test_sailable_heading_stays_outside_the_no_go_zone() -> None:
+    wind_from = 90.0
+    into_wind = sailable_heading(wind_from, 92.0)
+    fine_course = sailable_heading(wind_from, 0.0)
+
+    assert abs(signed_angle_diff(wind_from, into_wind)) >= NO_GO_ZONE_DEG
+    assert fine_course == 0.0
+
+
+# --- menu --------------------------------------------------------------------
+
+
+def test_menu_selection_wraps_in_both_directions() -> None:
+    menu = MenuState()
+    menu.move(-1)
+    assert menu.selected == len(LEVELS) - 1
+    menu.move(1)
+    assert menu.selected == 0
+
+
+def test_menu_keyboard_events_select_and_start() -> None:
+    pygame.init()
+    menu = MenuState()
+
+    down = pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_DOWN})
+    enter = pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_RETURN})
+    escape = pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_ESCAPE})
+
+    assert menu.handle_event(down) is None
+    assert menu.selected == 1
+    assert menu.handle_event(enter) == "start"
+    assert menu.handle_event(escape) == "quit"
+    pygame.quit()
+
+
+def test_menu_number_key_jumps_to_level_and_starts() -> None:
+    pygame.init()
+    menu = MenuState()
+    three = pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_3})
+
+    assert menu.handle_event(three) == "start"
+    assert menu.selected == 2
+    pygame.quit()
+
+
+def test_menu_mouse_click_on_row_starts_that_level() -> None:
+    pygame.init()
+    menu = MenuState()
+    row = menu_row_rect(4)
+    click = pygame.event.Event(
+        pygame.MOUSEBUTTONDOWN, {"button": 1, "pos": row.center}
+    )
+
+    assert menu.handle_event(click) == "start"
+    assert menu.selected == 4
+    pygame.quit()
+
+
+def test_menu_rows_do_not_overlap() -> None:
+    for first, second in zip(range(len(LEVELS)), range(1, len(LEVELS))):
+        assert menu_row_rect(first).bottom <= menu_row_rect(second).top + 8
+
+
+# --- drawing helpers ----------------------------------------------------------
 
 
 def test_boat_polygon_keeps_boat_centered() -> None:
@@ -93,6 +283,11 @@ def test_scaled_game_dt_slows_simulation_without_reversing_time() -> None:
     assert 0.0 < GAME_SPEED < 1.0
     assert scaled_game_dt(1.0) == GAME_SPEED
     assert scaled_game_dt(-1.0) == 0.0
+
+
+def test_format_time_renders_minutes_and_seconds() -> None:
+    assert format_time(0.0) == "00:00"
+    assert format_time(83.4) == "01:23"
 
 
 def test_sail_efficiency_combines_trim_and_angle_efficiency() -> None:
@@ -170,58 +365,6 @@ def test_sheet_lever_mouse_drag_updates_main_sheet() -> None:
     pygame.quit()
 
 
-def test_default_course_contains_buoys_and_rocks() -> None:
-    markers = default_course_markers()
-    kinds = {marker.kind for marker in markers}
-
-    assert "buoy" in kinds
-    assert "rock" in kinds
-    assert len([marker for marker in markers if marker.kind == "buoy"]) >= 4
-
-
-def test_course_point_moves_along_navigation_heading() -> None:
-    north = course_point((0.0, 0.0), 0.0, 100.0)
-    east = course_point((0.0, 0.0), 90.0, 100.0)
-
-    assert round(north[0], 6) == 0.0
-    assert round(north[1], 6) == 100.0
-    assert round(east[0], 6) == 100.0
-    assert round(east[1], 6) == 0.0
-
-
-def test_default_course_requires_upwind_zig_zags_then_downwind_run() -> None:
-    buoys = [marker for marker in default_course_markers() if marker.kind == "buoy"]
-
-    assert [buoy.label for buoy in buoys] == [
-        "Start",
-        "Tack 1",
-        "Tack 2",
-        "Tack 3",
-        "Windward",
-        "Run 1",
-        "Run 2",
-        "Finish",
-    ]
-
-    leg_angles = [
-        bearing_between(start.east, start.north, end.east, end.north)
-        for start, end in zip(buoys, buoys[1:])
-    ]
-    upwind_offsets = [
-        signed_angle_diff(angle, DEFAULT_COURSE_WIND_FROM_DEG)
-        for angle in leg_angles[:4]
-    ]
-
-    assert [offset < 0 for offset in upwind_offsets] == [True, False, True, False]
-    assert all(36.0 <= abs(offset) <= 44.0 for offset in upwind_offsets)
-
-    downwind_offsets = [
-        signed_angle_diff(angle, DEFAULT_COURSE_WIND_FROM_DEG)
-        for angle in leg_angles[4:]
-    ]
-    assert all(abs(abs(offset) - 180.0) < 0.1 for offset in downwind_offsets)
-
-
 def test_world_to_screen_scrolls_markers_as_boat_moves() -> None:
     sim = SailingSimulation()
     before = world_to_screen(sim, 0.0, 260.0)
@@ -230,16 +373,8 @@ def test_world_to_screen_scrolls_markers_as_boat_moves() -> None:
     after = world_to_screen(sim, 0.0, 260.0)
 
     assert after[1] > before[1]
-
-
-def test_visible_course_markers_filters_distant_objects() -> None:
-    sim = SailingSimulation()
-    markers = default_course_markers()
-
-    visible = visible_course_markers(sim, markers)
-
-    assert any(marker.label == "Start" for marker, _pos in visible)
-    assert all(-80 <= pos[0] <= WIDTH + 80 for _marker, pos in visible)
+    assert on_screen(before)
+    assert not on_screen((-500.0, -500.0))
 
 
 def test_visible_traffic_filters_distant_vessels() -> None:
@@ -352,21 +487,85 @@ def test_tiller_and_rudder_rotate_with_boat_heading() -> None:
     assert steering.rudder_tip[0] < steering.rudder_pivot[0]
 
 
-def test_handle_keys_can_be_imported_without_opening_a_window() -> None:
+def test_handle_keys_moves_tiller_without_a_window() -> None:
     pygame.init()
-    key_count = 512
-    keys = [False] * key_count
+    keys = defaultdict(bool)
+    keys[pygame.K_RIGHT] = True
     sim = SailingSimulation()
 
-    assert handle_keys(sim, keys, 0.016) is False
+    handle_keys(sim, keys, 0.1)
+
+    assert sim.boat.tiller > 0.0
     pygame.quit()
 
 
-def test_can_render_one_frame_to_a_surface() -> None:
+# --- rendering smoke tests -----------------------------------------------------
+
+
+def test_can_render_a_full_level_scene() -> None:
     pygame.init()
     surface = pygame.Surface((WIDTH, HEIGHT))
-    font = pygame.font.SysFont("arial", 18)
-    small = pygame.font.SysFont("arial", 15)
+    fonts = make_fonts()
+    session = LevelSession.begin(LEVELS[-1])
+    session.sim.penalty_timer = 1.0
+    visual = SailVisualState.from_sim(session.sim)
+
+    draw_scene(
+        surface,
+        fonts,
+        session,
+        visual,
+        MainSheetLever.default(),
+        NoSailZoneToggle.default(),
+        time_s=0.5,
+    )
+
+    center_color = surface.get_at(BOAT_CENTER)
+    assert center_color != surface.get_at((0, 0))
+    pygame.quit()
+
+
+def test_can_render_rocks_objectives_and_overlays() -> None:
+    pygame.init()
+    surface = pygame.Surface((WIDTH, HEIGHT))
+    fonts = make_fonts()
+    session = LevelSession.begin(LEVELS[4])
+
+    draw_water(surface, session.sim.wind.from_deg, 0.0)
+    draw_rocks(surface, session.sim)
+    draw_objectives(surface, fonts["small"], session, 0.0)
+    draw_target_arrow(surface, fonts["small"], session)
+    draw_hud_banner(surface, fonts["font"], fonts["small"], session)
+    draw_briefing(surface, fonts["font"], fonts["small"], session)
+    assert session.elapsed <= BRIEFING_SECONDS
+
+    session.sim.boat.capsized = True
+    session.update(0.02)
+    draw_respawn_countdown(surface, fonts["big"], fonts["font"], session)
+
+    session.respawn_timer = 0.0
+    session.completed = True
+    draw_level_complete(surface, fonts["big"], fonts["font"], session)
+    pygame.quit()
+
+
+def test_can_render_the_menu() -> None:
+    pygame.init()
+    surface = pygame.Surface((WIDTH, HEIGHT))
+    fonts = make_fonts()
+    menu = MenuState(selected=2, completed={1})
+
+    draw_menu(surface, fonts["big"], fonts["font"], fonts["small"], menu, 0.0)
+
+    row = menu_row_rect(2)
+    assert surface.get_at(row.center) != surface.get_at((WIDTH - 4, HEIGHT - 4))
+    pygame.quit()
+
+
+def test_can_render_panels_on_a_plain_simulation() -> None:
+    pygame.init()
+    surface = pygame.Surface((WIDTH, HEIGHT))
+    fonts = make_fonts()
     sim = SailingSimulation(
         traffic=[
             TrafficVessel("M", "motorboat", 70.0, 40.0, 250.0, 4.0),
@@ -376,18 +575,18 @@ def test_can_render_one_frame_to_a_surface() -> None:
     sim.penalty_timer = 1.0
 
     draw_water(surface, sim.wind.from_deg, 0.0)
-    draw_course_markers(surface, small, sim, default_course_markers(), 0.0)
-    draw_traffic_vessels(surface, small, sim, 0.0)
+    draw_traffic_vessels(surface, fonts["small"], sim, 0.0)
     draw_no_sail_zone(surface, sim, True)
     draw_boat(surface, sim)
-    draw_info_box(surface, font, small, sim)
+    draw_info_box(surface, fonts["font"], fonts["small"], sim)
     draw_tilt_meter(surface, pygame.Rect(24, 24, 305, 404), sim)
-    draw_wind_indicator(surface, font, sim)
-    draw_no_sail_toggle(surface, font, small, NoSailZoneToggle.default())
-    draw_sail_efficiency_panel(surface, font, small, sim)
-    draw_main_sheet_lever(surface, font, small, sim, MainSheetLever.default())
-    draw_rule_penalty(surface, font, sim)
-
-    center_color = surface.get_at(BOAT_CENTER)
-    assert center_color != surface.get_at((0, 0))
+    draw_wind_indicator(surface, fonts["font"], sim)
+    draw_no_sail_toggle(surface, fonts["font"], fonts["small"], NoSailZoneToggle.default())
+    draw_sail_efficiency_panel(surface, fonts["font"], fonts["small"], sim)
+    draw_main_sheet_lever(surface, fonts["font"], fonts["small"], sim, MainSheetLever.default())
+    draw_rule_penalty(surface, fonts["font"], sim)
     pygame.quit()
+
+
+def test_main_loop_runs_a_few_frames_headless() -> None:
+    main(max_frames=3)

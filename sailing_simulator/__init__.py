@@ -3,10 +3,10 @@
 from .physics import (
     BoatState,
     RightOfWayAssessment,
+    Rock,
     SailingSimulation,
     TrafficVessel,
     WindState,
-    default_traffic,
     sailing_terms,
     stability_state,
 )
@@ -14,10 +14,10 @@ from .physics import (
 __all__ = [
     "BoatState",
     "RightOfWayAssessment",
+    "Rock",
     "SailingSimulation",
     "TrafficVessel",
     "WindState",
-    "default_traffic",
     "sailing_terms",
     "stability_state",
 ]
